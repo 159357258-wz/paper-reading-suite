@@ -165,17 +165,33 @@ write_note    创建笔记
 write_item    导入图片附件
 ```
 
-**这来自「自定义 / 集成版」的 zotero-mcp（如 `zotero-integrated-mcp`，27 个工具）。**
+**这来自 [cookjohn/zotero-mcp](https://github.com/cookjohn/zotero-mcp) 这个 Zotero 插件（1.2k stars，MIT，作者 cookjohn）。**
 
-**而官方 [54yyyu/zotero-mcp](https://github.com/54yyyu/zotero-mcp)（44 个工具）用的是另一套名字：**
+**⭐ 具体来源已实测确认（解包 xpi 查 manifest.json）：**
 
 ```
-write_note        → zotero_manage_note
-write_item        → zotero_attach_file
-写操作还多一道 zotero_authorize_local_writes（会在 Zotero 里弹窗要你点授权）
+插件名:    Zotero MCP Plugin
+版本:      1.5.0（本机装的）
+插件 ID:   zotero-mcp-plugin@autoagent.my
+作者:      cookjohn
+更新源:    https://github.com/cookjohn/zotero-mcp/releases/latest/download/update.json
+write_note 出现在: content/scripts/zotero-mcp-plugin.js
 ```
 
-**两套接口不通用。** 你装了官方版，脚本会明确告诉你：
+### ⚠️ 别装错项目：`cookjohn/zotero-mcp` ≠ `54yyyu/zotero-mcp`
+
+**这是两个完全不同的项目，接口不通用。**
+
+| | **cookjohn/zotero-mcp** ✅ 本脚本用这个 | **54yyyu/zotero-mcp** ❌ 不兼容 |
+|---|---|---|
+| 形态 | **Zotero 插件**（.xpi 装进 Zotero） | Python MCP 服务端 |
+| 端口 | Zotero 进程自己监听 **23120** | 自己起服务 |
+| 工具数 | 27 | 44 |
+| 写笔记 | `write_note` ✅ | `zotero_manage_note` |
+| 导附件 | `write_item` ✅ | `zotero_attach_file` |
+| 写权限 | 直接可用 | 多一道 `zotero_authorize_local_writes`（Zotero 里弹窗点授权） |
+
+**装错的表现 —— 脚本会明确告诉你：**
 
 ```
 ❌ zotero-mcp 连上了，但缺少本脚本需要的工具：write_note（创建笔记）、write_item（导入图片附件）
@@ -187,7 +203,13 @@ write_item        → zotero_attach_file
    → 或者只跑本地部分：加 --skip-notes（完全不需要 MCP 和 key）
 ```
 
-**⭐⭐ 不想折腾 zotero-mcp 的话，加 `--skip-write` 就好 —— 前四步全都正常，笔记生成在本地，你自己复制进 Zotero。**
+**⭐⭐ 不想折腾的话，加 `--skip-write` 就好 —— 前面几步全都正常，笔记生成在本地，你自己复制进 Zotero。**
+
+### 那个 npm 包不是必须的
+
+`~/.dsh/mcp-servers/zotero-mcp/` 下的 npm 包（也是 `cookjohn/zotero-mcp` 这个仓库的 server 部分）**实际没被用到**。实测端口 23120 和 23119 的监听进程都是 `zotero.exe` 本身 —— MCP 端点是**插件内部起的 HTTP 服务**，不是那个 node 进程。
+
+**所以只用装插件，不用 `npm install zotero-mcp`。**
 
 ### norman_reader.py 为什么是可选的
 
@@ -214,11 +236,21 @@ pip install pymupdf
 
 **⭐ 到这一步，你就可以跑 `--skip-notes` 了**（切块 + 图表 + 完整性报告）。
 
-### 第 2.5 步：装 zotero-mcp（只有要写回 Zotero 才需要）
+### 第 2.5 步：装 zotero-mcp 插件（只有要写回 Zotero 才需要）
 
-需要一个提供 `write_note` / `write_item` 的版本，并让它在 `127.0.0.1:23120` 提供 MCP 端点。
+**装 [cookjohn/zotero-mcp](https://github.com/cookjohn/zotero-mcp) 这个 Zotero 插件**（不是 54yyyu 那个 Python 项目）。
 
-**没有或接口不对，就用 `--skip-write` 跳过这一步。**
+1. 去 [Releases](https://github.com/cookjohn/zotero-mcp/releases/latest) 下载 `zotero-mcp-plugin-x.y.z.xpi`
+2. Zotero → 工具 → 插件 → 齿轮 → **Install Plugin From File** → 选那个 .xpi
+3. 重启 Zotero
+4. 确认 23120 端口已开（Zotero 进程自己在听）
+
+**验证方式：** 跑 `python bin/paper_reading_suite.py --check`，应该看到
+`✅ zotero-mcp 有两个必需工具（write_note / write_item）`。
+
+**⭐ 只用装插件，不用 `npm install zotero-mcp`** —— 实测 23120 的监听进程就是 `zotero.exe` 本身。
+
+**没有或装错，就用 `--skip-write` 跳过这一步。**
 
 ### 第 3 步：配 DeepSeek key（只有要生成笔记文字才需要）
 
