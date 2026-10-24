@@ -135,24 +135,69 @@ Zotero 里，论文条目（parent）和它的 PDF 附件（attachment）是两�
 
 ---
 
-## 依赖
+## 依赖：三种用法要的东西不一样
 
-| 依赖 | 作用 | 必需 |
+**先看清你要跑哪一种，再决定装什么。**
+
+| 用法 | 需要什么 | 不需要什么 |
 |---|---|---|
-| **Zotero 7+** | 论文库 + 笔记写入目标 | ✅ |
-| **zotero-mcp 插件** | 提供 `write_note` / `write_item`，端口 23120 | ✅ |
-| **DeepSeek API key** | 6 处模型调用 | ✅ |
-| **Python 3.11+** | 运行脚本 | ✅ |
-| **PyMuPDF**（`pip install pymupdf`） | 切块 + 渲染页面 | ✅ |
-| ~~norman_reader.py~~ | 切块 + 渲染 | ⭕ **可选** |
+| `--skip-notes --skip-write`<br/>切块 + 章节 + 图表 + 渲染 + 完整性报告 | Python 3.11+<br/>PyMuPDF<br/>**Zotero 7+**（要读 `zotero.sqlite`） | ❌ DeepSeek key<br/>❌ zotero-mcp |
+| `--skip-write`<br/>上一行全部 + 5 条笔记文字 | 上面全部 +<br/>**DeepSeek API key** | ❌ zotero-mcp |
+| 不带参数<br/>全流程，写回 Zotero | 上面全部 +<br/>**zotero-mcp**（且必须提供 `write_note` / `write_item`） | — |
 
-**`norman_reader.py` 是可选的。** 没有它也能完整跑——脚本内置了等价的 PyMuPDF 实现，实测同一篇 PDF 切出 **196/196 blocks、text 100% 一致**，渲染出的 PNG 字节数也相同。
+### 完整依赖表
+
+| 组件 | 作用 | 必需性 | 怎么装 |
+|---|---|---|---|
+| **Python 3.11+** | 运行脚本 | 全流程 | [python.org](https://www.python.org/downloads/) |
+| **PyMuPDF** | 切块 + 渲染页面 | 全流程 | `pip install pymupdf` |
+| **Zotero 7+** | 论文库（脚本读它的 sqlite） | 全流程 | [zotero.org](https://www.zotero.org/download/)，**至少打开一次** |
+| **DeepSeek API key** | 5 条笔记的文字 | 要生成笔记时 | 见下面「第 3 步」 |
+| **zotero-mcp** | 写笔记 / 导图片回 Zotero | 要写库时 | 见下面「第 2 步」 |
+| ~~norman_reader.py~~ | 切块 + 渲染（替代 PyMuPDF 实现） | **可选** | 不用装，脚本有内置等价实现 |
+
+### ⚠️ 关于 zotero-mcp：接口有两套，目前不通用
+
+**本脚本的写库路径写死了两个工具名：**
+
+```
+write_note    创建笔记
+write_item    导入图片附件
+```
+
+**这来自「自定义 / 集成版」的 zotero-mcp（如 `zotero-integrated-mcp`，27 个工具）。**
+
+**而官方 [54yyyu/zotero-mcp](https://github.com/54yyyu/zotero-mcp)（44 个工具）用的是另一套名字：**
+
+```
+write_note        → zotero_manage_note
+write_item        → zotero_attach_file
+写操作还多一道 zotero_authorize_local_writes（会在 Zotero 里弹窗要你点授权）
+```
+
+**两套接口不通用。** 你装了官方版，脚本会明确告诉你：
+
+```
+❌ zotero-mcp 连上了，但缺少本脚本需要的工具：write_note（创建笔记）、write_item（导入图片附件）
+   服务端 http://127.0.0.1:23120/mcp 共提供 44 个工具
+   诊断：你连的像是官方 54yyyu/zotero-mcp —— 它把写笔记叫 zotero_manage_note，
+         把附件叫 zotero_attach_file。本脚本只认 write_note / write_item。
+   → 需要带 write_note + write_item 的 zotero-mcp 变体
+   → 或者跳过写库：加 --skip-write（笔记只生成不写回 Zotero）
+   → 或者只跑本地部分：加 --skip-notes（完全不需要 MCP 和 key）
+```
+
+**⭐⭐ 不想折腾 zotero-mcp 的话，加 `--skip-write` 就好 —— 前四步全都正常，笔记生成在本地，你自己复制进 Zotero。**
+
+### norman_reader.py 为什么是可选的
+
+没有它也能完整跑。脚本内置了等价的 PyMuPDF 实现，实测同一篇 PDF 切出 **196/196 blocks、text 100% 一致**，渲染出的 PNG 字节数也完全相同。
 
 有它就用它（多一层源映射校验），没有就用内置的。用 `NORMAN_READER` 环境变量可以显式指向它。
 
 ---
 
-## 安装（四步）
+## 安装
 
 ### 第 1 步：装 Python 依赖
 
@@ -162,13 +207,20 @@ pip install pymupdf
 
 只要这一个。其余都是标准库。
 
-### 第 2 步：装 Zotero + zotero-mcp
+### 第 2 步：装 Zotero
 
 1. 装 [Zotero 7](https://www.zotero.org/download/)，**至少打开一次**（它会生成 `zotero.sqlite`）
-2. 装 [zotero-mcp](https://github.com/54yyyu/zotero-mcp) 插件，让它在 `127.0.0.1:23120` 提供 MCP 端点
-3. 把你准备精读的 PDF 拖进 Zotero
+2. 把你准备精读的 PDF 拖进 Zotero
 
-### 第 3 步：配 DeepSeek key
+**⭐ 到这一步，你就可以跑 `--skip-notes` 了**（切块 + 图表 + 完整性报告）。
+
+### 第 2.5 步：装 zotero-mcp（只有要写回 Zotero 才需要）
+
+需要一个提供 `write_note` / `write_item` 的版本，并让它在 `127.0.0.1:23120` 提供 MCP 端点。
+
+**没有或接口不对，就用 `--skip-write` 跳过这一步。**
+
+### 第 3 步：配 DeepSeek key（只有要生成笔记文字才需要）
 
 建一个文件，里面**只写一行** key：
 

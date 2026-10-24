@@ -927,22 +927,58 @@ def preflight(need_notes, need_write):
             else:
                 notes.append("✅ DeepSeek key 已读到（%d 字符）" % len(k))
 
-    # 4. zotero-mcp（只在要写库时需要）
+    # 4. zotero-mcp（只在要写库时需要）——不光要连得上，还要有两个具体工具
     if need_write:
-        try:
-            import urllib.request as _u
-            req = _u.Request(MCP, data=b'{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
+        import urllib.request as _u
+
+        def _mcp(method, params=None, timeout=15):
+            body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method,
+                               "params": params or {}}).encode()
+            req = _u.Request(MCP, data=body,
                 headers={"Content-Type": "application/json",
                          "Accept": "application/json, text/event-stream"}, method="POST")
-            with _u.urlopen(req, timeout=10) as r:
-                r.read()
-            notes.append("✅ zotero-mcp 可达（%s）" % MCP)
+            with _u.urlopen(req, timeout=timeout) as r:
+                raw = r.read().decode("utf-8", errors="replace")
+            if raw.startswith("event:") or "data: " in raw[:100]:
+                for line in raw.split("\n"):
+                    if line.startswith("data: "):
+                        raw = line[6:]
+                        break
+            return json.loads(raw)
+
+        tools = None
+        try:
+            tl = _mcp("tools/list")
+            tools = {t.get("name") for t in tl.get("result", {}).get("tools", [])}
         except Exception as e:
             problems.append(
                 "连不上 zotero-mcp：%s\n"
                 "     错误：%s\n"
-                "     → 需要装 zotero-mcp 插件并在 Zotero 里启用（默认端口 23120）\n"
+                "     → 需要装 zotero-mcp 插件并在 Zotero 里启用\n"
                 "     → 或设环境变量 ZOTERO_MCP_URL 指向你的端点" % (MCP, str(e)[:100]))
+
+        if tools is not None:
+            # 本脚本的写库路径写死了这两个工具名，必须存在
+            REQ = {"write_note": "创建笔记", "write_item": "导入图片附件"}
+            missing = [k for k, v in REQ.items() if k not in tools]
+            if missing:
+                # 给出「你装的是官方版」这种最常见情况的明确诊断
+                hint = ""
+                if "zotero_manage_note" in tools:
+                    hint = ("\n     诊断：你连的像是官方 54yyyu/zotero-mcp —— 它把写笔记叫 "
+                            "zotero_manage_note，把附件叫 zotero_attach_file。\n"
+                            "     本脚本只认 write_note / write_item（自定义/集成版命名），"
+                            "所以这两套接口目前不通用。")
+                problems.append(
+                    "zotero-mcp 连上了，但缺少本脚本需要的工具：%s\n"
+                    "     服务端 %s 共提供 %d 个工具%s\n"
+                    "     → 需要带 write_note + write_item 的 zotero-mcp 变体\n"
+                    "     → 或者跳过写库：加 --skip-write（笔记只生成不写回 Zotero）\n"
+                    "     → 或者只跑本地部分：加 --skip-notes（完全不需要 MCP 和 key）"
+                    % ("、".join("%s（%s）" % (k, REQ[k]) for k in missing),
+                       MCP, len(tools), hint))
+            else:
+                notes.append("✅ zotero-mcp 有两个必需工具（write_note / write_item），共 %d 个" % len(tools))
 
     # 5. norman_reader（可选）
     if os.path.exists(NORMAN):
@@ -982,9 +1018,33 @@ def main():
     need_write = need_notes and not args.skip_write
 
     if args.check:
-        preflight(True, True)
+        # 全量检查，并把「三种用法各需要什么」一并打出来
+        ok = True
+        try:
+            preflight(True, True)
+        except SystemExit:
+            ok = False
         log("")
-        log("✅ 环境齐全，可以跑完整流程")
+        log("=" * 78)
+        log("三种用法，需要的东西不一样")
+        log("=" * 78)
+        log("  python paper_reading_suite.py <key> --skip-notes --skip-write")
+        log("      → 切块 + 章节 + 图表 + 渲染 + 完整性报告")
+        log("      → 只要：pymupdf + Zotero")
+        log("      → 不要：DeepSeek key、zotero-mcp")
+        log("")
+        log("  python paper_reading_suite.py <key> --skip-write")
+        log("      → 上面全部 + 5 条笔记的文字（不写回 Zotero）")
+        log("      → 还要：DeepSeek key")
+        log("")
+        log("  python paper_reading_suite.py <key>")
+        log("      → 全流程，含写回 Zotero（5 条笔记 + 图表页图片）")
+        log("      → 还要：zotero-mcp，且必须提供 write_note 和 write_item 两个工具")
+        log("")
+        if ok:
+            log("✅ 上面三项全部具备，可以跑完整流程")
+        else:
+            log("⚠️  有缺项。按上面三条对照，缺哪项补哪项；也可以先用 --skip-notes 跑本地部分。")
         return
 
     # 工作目录：用户没指定就放在 TMP 下
