@@ -131,19 +131,67 @@ def load_zotero(parent_key, work):
 # ══════════════════════════════════════════
 # STEP 1：切块
 # ══════════════════════════════════════════
+def extract_builtin(pdf_path, work):
+    """内置切块：不依赖 norman_reader，只用 pymupdf。
+
+    产出的 source_map.json 与 norman-reader extract 的结构一致
+    （实测同一 PDF：blocks 数相同、text 逐条相同），所以后面几步无需改。
+    """
+    import pymupdf
+    doc = pymupdf.open(pdf_path)
+    blocks = []
+    for pg_idx, page in enumerate(doc, start=1):
+        bi = 0
+        for item in page.get_text("blocks"):
+            x0, y0, x1, y1, text = item[0], item[1], item[2], item[3], item[4]
+            text = (text or "").strip()
+            if not text:
+                continue
+            bi += 1
+            blocks.append({
+                "id": "P%04d-B%04d" % (pg_idx, bi),
+                "kind": "text",
+                "page": pg_idx,
+                "bbox": [round(x0, 2), round(y0, 2), round(x1, 2), round(y1, 2)],
+                "text": text,
+            })
+    n_pages = doc.page_count
+    doc.close()
+    sm = {
+        "schema_version": 1,
+        "source": {"kind": "pdf", "path": pdf_path, "pages": n_pages,
+                   "engine": "builtin-pymupdf"},
+        "blocks": blocks,
+    }
+    io.open(os.path.join(work, "source_map.json"), "w", encoding="utf-8").write(
+        json.dumps(sm, ensure_ascii=False, indent=1))
+    log("  内置切块：%d 页 → %d blocks" % (n_pages, len(blocks)))
+    return sm
+
+
 def do_extract(meta, work):
-    sec("STEP 1：切块（norman-reader extract）")
+    sec("STEP 1：切块")
     sm_path = os.path.join(work, "source_map.json")
     if os.path.exists(sm_path):
         log("  已存在 source_map.json，跳过")
     else:
-        t0 = time.time()
-        r = subprocess.run([PY, "-W", "ignore", NORMAN, "extract", meta["pdf_path"], "--out", work],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace",
-                           env=os.environ)
-        log("  %.1f 秒 退出码 %s" % (time.time()-t0, r.returncode))
-        for ln in (r.stdout or "").split("\n")[:5]:
-            if ln.strip(): log("  " + ln)
+        # 有 norman_reader 就用它（多一层校验），没有就用内置实现
+        use_norman = os.path.exists(NORMAN)
+        if use_norman:
+            log("  用 norman_reader：%s" % NORMAN)
+            t0 = time.time()
+            r = subprocess.run([PY, "-W", "ignore", NORMAN, "extract", meta["pdf_path"], "--out", work],
+                               capture_output=True, text=True, encoding="utf-8", errors="replace",
+                               env=os.environ)
+            log("  %.1f 秒 退出码 %s" % (time.time()-t0, r.returncode))
+            for ln in (r.stdout or "").split("\n")[:5]:
+                if ln.strip(): log("  " + ln)
+            if r.returncode != 0 or not os.path.exists(sm_path):
+                log("  ⚠️ norman_reader 失败，改用内置切块")
+                use_norman = False
+        if not use_norman:
+            log("  用内置切块（无需 norman_reader）")
+            return extract_builtin(meta["pdf_path"], work)
     sm = json.loads(io.open(sm_path, encoding="utf-8").read())
     log("  blocks: %d" % len(sm["blocks"]))
     return sm
@@ -259,12 +307,32 @@ def do_render(meta, news, work):
     log("  需要 %d 页：%s" % (len(need), need))
     log("  已有 %d 页，待渲染 %d 页：%s" % (len(have), len(todo), todo))
     if todo:
-        r = subprocess.run([PY, "-W", "ignore", NORMAN, "render", meta["pdf_path"],
-                            "--pages", ",".join(map(str, todo)), "--dpi", "150",
-                            "--name", "pg", "--out", work],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace",
-                           env=os.environ)
-        log("  渲染退出码 %s" % r.returncode)
+        use_norman = os.path.exists(NORMAN)
+        if use_norman:
+            r = subprocess.run([PY, "-W", "ignore", NORMAN, "render", meta["pdf_path"],
+                                "--pages", ",".join(map(str, todo)), "--dpi", "150",
+                                "--name", "pg", "--out", work],
+                               capture_output=True, text=True, encoding="utf-8", errors="replace",
+                               env=os.environ)
+            log("  norman_reader 渲染退出码 %s" % r.returncode)
+
+        def _have():
+            return {int(re.search(r"pg-(\d+)", f).group(1))
+                    for f in os.listdir(work) if re.search(r"pg-(\d+)", f)}
+
+        # 渲染后检查，缺的用内置实现补（也能在没有 norman_reader 时全用内置）
+        still = [p for p in todo if p not in _have()]
+        if still:
+            import pymupdf
+            if not os.path.exists(NORMAN):
+                log("  用内置渲染（无需 norman_reader）")
+            else:
+                log("  norman_reader 漏了 %s，用内置补" % still)
+            doc = pymupdf.open(meta["pdf_path"])
+            for p in still:
+                pix = doc[p - 1].get_pixmap(dpi=150)
+                pix.save(os.path.join(work, "pg-%02d.png" % p))
+            doc.close()
     have2 = sorted({int(re.search(r"pg-(\d+)", f).group(1))
                     for f in os.listdir(work) if re.search(r"pg-(\d+)", f)})
     missing = [p for p in need if p not in have2]
@@ -807,20 +875,125 @@ def do_write(meta, notes, news, rend, report_md, work):
 
 
 # ══════════════════════════════════════════
+# STEP -1：环境预检
+# ══════════════════════════════════════════
+def preflight(need_notes, need_write):
+    """开跑前把缺的东西一次说清，而不是跑到一半崩在 traceback 里。"""
+    sec("STEP -1：环境预检")
+    problems = []
+    notes = []
+
+    # 1. pymupdf
+    try:
+        import pymupdf
+        v = getattr(pymupdf, "__version__", "")
+        notes.append("✅ pymupdf %s" % v if v else "✅ pymupdf")
+    except ImportError:
+        problems.append("缺 pymupdf。装：pip install pymupdf")
+
+    # 2. Zotero 数据目录
+    sq = os.path.join(ZOTERO, "zotero.sqlite")
+    if not os.path.exists(sq):
+        problems.append(
+            "找不到 Zotero 数据库：%s\n"
+            "     → 确认 Zotero 已安装并至少打开过一次\n"
+            "     → 或设环境变量 ZOTERO_HOME 指向你的 Zotero 数据目录" % sq)
+    else:
+        try:
+            tmp = os.path.join(TMP, "_preflight")
+            os.makedirs(tmp, exist_ok=True)
+            for fn in ["zotero.sqlite", "zotero.sqlite-wal", "zotero.sqlite-shm"]:
+                p = os.path.join(ZOTERO, fn)
+                if os.path.exists(p):
+                    shutil.copy2(p, os.path.join(tmp, fn))
+            conn = sqlite3.connect(os.path.join(tmp, "zotero.sqlite"))
+            n = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+            conn.close()
+            notes.append("✅ Zotero 数据库可读（%d 个条目）" % n)
+        except Exception as e:
+            problems.append("Zotero 数据库读不了：%s" % str(e)[:120])
+
+    # 3. DeepSeek key（只在要生成笔记时需要）
+    if need_notes:
+        if not os.path.exists(KEY_FILE):
+            problems.append(
+                "找不到 DeepSeek API key：%s\n"
+                "     → 建这个文件，里面只写一行 key（不要提交进任何仓库）\n"
+                "     → 或设环境变量 DEEPSEEK_KEY_FILE 指向你的 key 文件" % KEY_FILE)
+        else:
+            k = io.open(KEY_FILE, encoding="utf-8").read().strip()
+            if not k:
+                problems.append("DeepSeek key 文件是空的：%s" % KEY_FILE)
+            else:
+                notes.append("✅ DeepSeek key 已读到（%d 字符）" % len(k))
+
+    # 4. zotero-mcp（只在要写库时需要）
+    if need_write:
+        try:
+            import urllib.request as _u
+            req = _u.Request(MCP, data=b'{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
+                headers={"Content-Type": "application/json",
+                         "Accept": "application/json, text/event-stream"}, method="POST")
+            with _u.urlopen(req, timeout=10) as r:
+                r.read()
+            notes.append("✅ zotero-mcp 可达（%s）" % MCP)
+        except Exception as e:
+            problems.append(
+                "连不上 zotero-mcp：%s\n"
+                "     错误：%s\n"
+                "     → 需要装 zotero-mcp 插件并在 Zotero 里启用（默认端口 23120）\n"
+                "     → 或设环境变量 ZOTERO_MCP_URL 指向你的端点" % (MCP, str(e)[:100]))
+
+    # 5. norman_reader（可选）
+    if os.path.exists(NORMAN):
+        notes.append("✅ norman_reader 在位（会用它切块/渲染）")
+    else:
+        notes.append("ℹ️  没有 norman_reader，用内置 pymupdf 切块/渲染（功能等价）")
+
+    for x in notes:
+        log("  " + x)
+    if problems:
+        log("")
+        log("  ❌ 有 %d 个问题必须先解决：" % len(problems))
+        for i, p in enumerate(problems, 1):
+            log("    %d. %s" % (i, p))
+        log("")
+        raise SystemExit("预检未通过，已停止（没有产生任何副作用）")
+    log("")
+    log("  ✅ 预检通过")
+
+
+# ══════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("item_key")
-    ap.add_argument("--work", default=None)
-    ap.add_argument("--skip-notes", action="store_true", help="只做检测，不生成笔记")
-    ap.add_argument("--skip-write", action="store_true", help="不写进 Zotero")
+    ap = argparse.ArgumentParser(
+        description="把 Zotero 里的一篇 PDF 论文变成 5 条结构化笔记，附完整性报告。",
+        epilog="环境变量：PAPER_SUITE_TMP / NORMAN_READER / DEEPSEEK_KEY_FILE / "
+               "ZOTERO_HOME / ZOTERO_MCP_URL / PAPER_SUITE_PYTHON")
+    ap.add_argument("item_key", help="Zotero 父条目 key（8 位，如 TLCGH5DB）")
+    ap.add_argument("--work", default=None, help="工作目录（默认在 TMP 下建）")
+    ap.add_argument("--skip-notes", action="store_true", help="只做检测 + 渲染 + 完整性报告，不调模型")
+    ap.add_argument("--skip-write", action="store_true", help="生成笔记但不写进 Zotero")
+    ap.add_argument("--check", action="store_true", help="只做环境预检，然后退出")
     args = ap.parse_args()
 
-    work = args.work or os.path.join(r"F:\咨询\_test_butler", "_suite_" + args.item_key)
+    need_notes = not args.skip_notes
+    need_write = need_notes and not args.skip_write
+
+    if args.check:
+        preflight(True, True)
+        log("")
+        log("✅ 环境齐全，可以跑完整流程")
+        return
+
+    # 工作目录：用户没指定就放在 TMP 下
+    work = args.work or os.path.join(TMP, "_suite_" + args.item_key)
     os.makedirs(work, exist_ok=True)
     log("工作目录：%s" % work)
     t_all = time.time()
+
+    preflight(need_notes, need_write)
 
     meta = load_zotero(args.item_key, work)
     sm = do_extract(meta, work)

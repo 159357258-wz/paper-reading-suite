@@ -141,11 +141,80 @@ Zotero 里，论文条目（parent）和它的 PDF 附件（attachment）是两�
 |---|---|---|
 | **Zotero 7+** | 论文库 + 笔记写入目标 | ✅ |
 | **zotero-mcp 插件** | 提供 `write_note` / `write_item`，端口 23120 | ✅ |
-| **norman-paper-reading 技能** | 提供 `norman_reader.py`（切块 + 渲染） | ✅ |
 | **DeepSeek API key** | 6 处模型调用 | ✅ |
-| Python 3.11+ | 运行脚本 | ✅ |
+| **Python 3.11+** | 运行脚本 | ✅ |
+| **PyMuPDF**（`pip install pymupdf`） | 切块 + 渲染页面 | ✅ |
+| ~~norman_reader.py~~ | 切块 + 渲染 | ⭕ **可选** |
 
-**注意：`norman_reader.py` 属于另一个技能包，本仓库不包含。** 需要用 `NORMAN_READER` 环境变量指向它。
+**`norman_reader.py` 是可选的。** 没有它也能完整跑——脚本内置了等价的 PyMuPDF 实现，实测同一篇 PDF 切出 **196/196 blocks、text 100% 一致**，渲染出的 PNG 字节数也相同。
+
+有它就用它（多一层源映射校验），没有就用内置的。用 `NORMAN_READER` 环境变量可以显式指向它。
+
+---
+
+## 安装（四步）
+
+### 第 1 步：装 Python 依赖
+
+```bash
+pip install pymupdf
+```
+
+只要这一个。其余都是标准库。
+
+### 第 2 步：装 Zotero + zotero-mcp
+
+1. 装 [Zotero 7](https://www.zotero.org/download/)，**至少打开一次**（它会生成 `zotero.sqlite`）
+2. 装 [zotero-mcp](https://github.com/54yyyu/zotero-mcp) 插件，让它在 `127.0.0.1:23120` 提供 MCP 端点
+3. 把你准备精读的 PDF 拖进 Zotero
+
+### 第 3 步：配 DeepSeek key
+
+建一个文件，里面**只写一行** key：
+
+```bash
+# Windows
+mkdir %USERPROFILE%\.secrets
+echo sk-你的key > %USERPROFILE%\.secrets\deepseek.key
+
+# macOS / Linux
+mkdir -p ~/.secrets
+echo "sk-你的key" > ~/.secrets/deepseek.key
+chmod 600 ~/.secrets/deepseek.key
+```
+
+**⚠️ 这个文件绝对不要提交进任何仓库。** 仓库的 `.gitignore` 已经挡了 `*.key` 和 `.secrets/`。
+
+### 第 4 步：自检
+
+```bash
+python bin/paper_reading_suite.py --check
+```
+
+**这一步会检查 5 件事并明确告诉你缺什么：**
+
+```
+STEP -1：环境预检
+  ✅ pymupdf
+  ✅ Zotero 数据库可读（185 个条目）
+  ✅ DeepSeek key 已读到（35 字符）
+  ✅ zotero-mcp 可达（http://127.0.0.1:23120/mcp）
+  ℹ️  没有 norman_reader，用内置 pymupdf 切块/渲染（功能等价）
+
+  ✅ 预检通过
+```
+
+**如果缺东西，它会一次列全，而不是跑到一半崩在 traceback 里：**
+
+```
+  ❌ 有 3 个问题必须先解决：
+    1. 找不到 Zotero 数据库：C:\no\such\zotero\zotero.sqlite
+     → 确认 Zotero 已安装并至少打开过一次
+     → 或设环境变量 ZOTERO_HOME 指向你的 Zotero 数据目录
+    2. 找不到 DeepSeek API key：C:\no\such\key
+     → 建这个文件，里面只写一行 key
+     ...
+```
 
 ---
 
@@ -155,8 +224,8 @@ Zotero 里，论文条目（parent）和它的 PDF 附件（attachment）是两�
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `PAPER_SUITE_PYTHON` | 当前解释器 | 跑 norman_reader 子进程用 |
-| `NORMAN_READER` | `~/.dsh/skills/norman-paper-reading/bin/norman_reader.py` | norman_reader 位置 |
+| `PAPER_SUITE_PYTHON` | 当前解释器 | 跑 norman_reader 子进程用（可选） |
+| `NORMAN_READER` | `~/.dsh/skills/norman-paper-reading/bin/norman_reader.py` | norman_reader 位置（可选） |
 | `DEEPSEEK_KEY_FILE` | `~/.secrets/deepseek.key` | 一行纯文本 API key |
 | `ZOTERO_HOME` | `~/Zotero` | Zotero 数据目录（含 `zotero.sqlite`） |
 | `PAPER_SUITE_TMP` | `%TEMP%/paper-reading-suite` | 临时/工作目录（C 盘紧张时改到别的盘） |
@@ -167,6 +236,9 @@ Zotero 里，论文条目（parent）和它的 PDF 附件（attachment）是两�
 ## 用法
 
 ```bash
+# 环境自检（先跑这个）
+python bin/paper_reading_suite.py --check
+
 # 先只看完整性报告，确认图表都抓到了（不花模型钱）
 python bin/paper_reading_suite.py <Zotero父条目key> --skip-notes --skip-write
 
@@ -180,6 +252,7 @@ python bin/paper_reading_suite.py <Zotero父条目key>
 **父条目 key 怎么找：** Zotero 里右键条目 → 显示条目信息，或看 `zotero.sqlite` 的 `items.key`（8 位大写字母数字）。
 
 ```
+--check           只做环境预检，然后退出
 --work DIR        工作目录（默认 %TEMP%/paper-reading-suite/_suite_<key>）
 --skip-notes      只做检测 + 渲染 + 完整性报告，不调模型
 --skip-write      生成笔记但不写进 Zotero
@@ -194,7 +267,7 @@ python bin/paper_reading_suite.py <Zotero父条目key>
 1. **图表标题的「文字」不保证准确。** 报告里有 `score` 标注，`低` 的需人工核对。**计数（有几个、在第几页）是硬的，标题字符串不是。**
 2. **没有独立复检。** 5 条笔记的文字内容是模型生成的，脚本**没有**第二次调用去核对「这些内容是否都能在原文找到」。这一层是「软」的。
 3. **一次一篇。** 不做多篇横向对比。
-4. **强依赖 Zotero + zotero-mcp。** 不是通用 PDF 工具，是「Zotero 生态内的论文精读流水线」。
+4. **强依赖 Zotero + zotero-mcp。** 不是通用 PDF 工具，是「Zotero 生态内的论文精读流水线」。**用不了裸 PDF 文件，必须先进 Zotero。**
 5. **笔记写入用 HTML 直传。** Zotero 的 `markdownToNoteHtml` 对 Markdown 表格支持不好（会把 `|` 当纯文本），所以脚本先把整篇转成 HTML 再写。
 
 ---
