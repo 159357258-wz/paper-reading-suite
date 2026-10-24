@@ -1,0 +1,865 @@
+"""论文阅读套件 · 单一入口
+用法：python paper_reading_suite.py <Zotero父条目key> [--work 工作目录] [--skip-notes]
+
+一条命令完成：
+  1. 从 Zotero 取 PDF + 元数据
+  2. norman-reader extract 切块
+  3. 检测：章节（PDF书签优先）+ 图表（行首锚定）
+  4. 渲染全部图表页
+  5. 生成完整性报告
+  6. 生成 5 条笔记（飞书速览 / 证据链 / 逐节精读 / 零基础拆解 / 决策地图）
+  7. 写进 Zotero（图片作为附件，笔记里嵌完整性报告）
+"""
+import os, sys, json, io, re, time, sqlite3, shutil, subprocess, argparse
+from collections import defaultdict, Counter
+
+# ─── 路径常量（都可用环境变量覆盖，便于换机器）───
+# PY      : 跑 norman_reader 子进程用的解释器（默认用当前解释器）
+# NORMAN  : norman_reader.py 的位置（来自 norman-paper-reading 技能）
+# KEY_FILE: DeepSeek API key 文件（一行纯文本，不要提交进仓库）
+# ZOTERO  : Zotero 数据目录
+# TMP     : 临时/工作目录（C 盘紧张时改到别的盘）
+# MCP     : zotero-mcp 插件的 Streamable HTTP 端点
+PY = os.environ.get("PAPER_SUITE_PYTHON") or sys.executable
+NORMAN = os.environ.get("NORMAN_READER") or os.path.expanduser(
+    r"~/.dsh/skills/norman-paper-reading/bin/norman_reader.py")
+KEY_FILE = os.environ.get("DEEPSEEK_KEY_FILE") or os.path.expanduser(r"~/.secrets/deepseek.key")
+ZOTERO = os.environ.get("ZOTERO_HOME") or os.path.expanduser(r"~/Zotero")
+TMP = os.environ.get("PAPER_SUITE_TMP") or os.path.join(
+    os.environ.get("TEMP") or os.path.expanduser("~"), "paper-reading-suite")
+MCP = os.environ.get("ZOTERO_MCP_URL") or "http://127.0.0.1:23120/mcp"
+
+# 子进程（norman_reader）也用同一个临时目录：它提取 PDF 时会写中间文件
+os.environ["TEMP"] = TMP
+os.environ["TMP"] = TMP
+os.makedirs(TMP, exist_ok=True)
+
+LIG = {"\uFB00": "ff", "\uFB01": "fi", "\uFB02": "fl", "\uFB03": "ffi",
+       "\uFB04": "ffl", "\uFB05": "ft", "\uFB06": "st"}
+
+
+def norm(t):
+    for k, v in LIG.items():
+        t = t.replace(k, v)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def sec(title):
+    log("")
+    log("=" * 78)
+    log(title)
+    log("=" * 78)
+
+
+# ══════════════════════════════════════════
+# STEP 0：读 Zotero
+# ══════════════════════════════════════════
+def load_zotero(parent_key, work):
+    sec("STEP 0：从 Zotero 取 PDF 与元数据")
+    tmp = os.path.join(TMP, "_suite_db")
+    if os.path.isdir(tmp): shutil.rmtree(tmp)
+    os.makedirs(tmp)
+    for fn in ["zotero.sqlite", "zotero.sqlite-wal", "zotero.sqlite-shm"]:
+        p = os.path.join(ZOTERO, fn)
+        if os.path.exists(p): shutil.copy2(p, os.path.join(tmp, fn))
+    conn = sqlite3.connect(os.path.join(tmp, "zotero.sqlite"))
+    cur = conn.cursor()
+    cur.execute("SELECT itemID, libraryID FROM items WHERE key=?", (parent_key,))
+    r = cur.fetchone()
+    if not r:
+        raise SystemExit("❌ 找不到条目 %s" % parent_key)
+    pid, lib = r
+
+    def f(name):
+        cur.execute("""SELECT v.value FROM itemData d
+                       JOIN itemDataValues v ON v.valueID=d.valueID
+                       JOIN fields fd ON fd.fieldID=d.fieldID
+                       WHERE d.itemID=? AND fd.fieldName=?""", (pid, name))
+        rr = cur.fetchone()
+        return rr[0] if rr else ""
+
+    cur.execute("""SELECT c.firstName, c.lastName FROM itemCreators ic
+                   JOIN creators c ON c.creatorID=ic.creatorID
+                   WHERE ic.itemID=? ORDER BY ic.orderIndex""", (pid,))
+    creators = cur.fetchall()
+    cur.execute("""SELECT a.key, ia.path FROM itemAttachments ia
+                   JOIN items a ON a.itemID=ia.itemID
+                   WHERE ia.parentItemID=? AND ia.contentType='application/pdf'
+                   ORDER BY ia.itemID LIMIT 1""", (pid,))
+    ar = cur.fetchone()
+
+    # 先把所有字段查完（f() 依赖 cur，必须在 close 之前全部调用）
+    v_title = f("title")
+    v_date = f("date")
+    v_venue = f("publicationTitle")
+    v_doi = f("DOI")
+    v_abstract = f("abstractNote")
+    conn.close()
+
+    if not ar:
+        raise SystemExit("❌ 条目 %s 下没有 PDF 附件" % parent_key)
+
+    att_key, att_path = ar
+    pdf = os.path.join(ZOTERO, "storage", att_key, str(att_path).replace("storage:", ""))
+    if not os.path.exists(pdf):
+        raise SystemExit("❌ PDF 文件不存在：%s" % pdf)
+
+    m = re.match(r"(\d{4})", v_date)
+    meta = {
+        "parent_key": parent_key, "parent_id": pid, "library_id": lib,
+        "title": v_title,
+        "authors": ", ".join((a + " " + b).strip() for a, b in creators[:5]),
+        "year": m.group(1) if m else "",
+        "venue": v_venue, "doi": v_doi,
+        "abstract": v_abstract,
+        "attachment_key": att_key, "pdf_path": pdf,
+    }
+    io.open(os.path.join(work, "meta.json"), "w", encoding="utf-8").write(
+        json.dumps(meta, ensure_ascii=False, indent=1))
+    log("  标题: %s" % meta["title"][:70])
+    log("  作者: %s" % meta["authors"][:60])
+    log("  年份: %s ｜ 期刊: %s" % (meta["year"], meta["venue"]))
+    log("  DOI : %s" % meta["doi"])
+    log("  PDF : %.1f MB" % (os.path.getsize(pdf)/1024/1024))
+    return meta
+
+
+# ══════════════════════════════════════════
+# STEP 1：切块
+# ══════════════════════════════════════════
+def do_extract(meta, work):
+    sec("STEP 1：切块（norman-reader extract）")
+    sm_path = os.path.join(work, "source_map.json")
+    if os.path.exists(sm_path):
+        log("  已存在 source_map.json，跳过")
+    else:
+        t0 = time.time()
+        r = subprocess.run([PY, "-W", "ignore", NORMAN, "extract", meta["pdf_path"], "--out", work],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           env=os.environ)
+        log("  %.1f 秒 退出码 %s" % (time.time()-t0, r.returncode))
+        for ln in (r.stdout or "").split("\n")[:5]:
+            if ln.strip(): log("  " + ln)
+    sm = json.loads(io.open(sm_path, encoding="utf-8").read())
+    log("  blocks: %d" % len(sm["blocks"]))
+    return sm
+
+
+# ══════════════════════════════════════════
+# STEP 2：检测章节 + 图表
+# ══════════════════════════════════════════
+def do_detect(meta, sm, work):
+    import pymupdf
+    sec("STEP 2：检测章节与图表")
+    blocks = sm["blocks"]
+    doc = pymupdf.open(meta["pdf_path"])
+    n_pages = doc.page_count
+
+    # ── 章节：书签优先 ──
+    toc = doc.get_toc()
+    chapters = []
+    if toc:
+        src = "PDF 书签（outline）"
+        for lvl, title, pg in toc:
+            t = norm(title)
+            if re.match(r"^(References|Bibliography|Appendix|Acknowledg|Contents)", t, re.I):
+                continue
+            chapters.append({"level": lvl + 1, "number": "", "heading": t, "page": pg, "from": "bookmark"})
+    else:
+        src = "正文正则（PDF 无书签）"
+        TC = r"A-Za-z\uFB00-\uFB06\u2013\u2014\-\s,\(\)/&':’\""
+        rx = re.compile(r"^(\d+(?:\.\d+){0,3})\.?\s+([" + TC + r"]{2,88})$")
+        seen = set()
+        for b in blocks:
+            for ln in (b.get("text") or "").split("\n"):
+                m = rx.match(ln.strip())
+                if m:
+                    num, title = m.group(1), norm(m.group(2))
+                    if (num, title.lower()) in seen: continue
+                    seen.add((num, title.lower()))
+                    chapters.append({"level": num.count(".") + 2, "number": num,
+                                     "heading": title, "page": b.get("page"), "from": "regex"})
+    log("  章节来源：%s，共 %d 条" % (src, len(chapters)))
+
+    # ── 按章节切文本 ──
+    bs = sorted(blocks, key=lambda b: (b.get("page") or 0, b.get("id") or ""))
+    def find_start(ch):
+        target = norm(ch["heading"]).lower()[:30]
+        for i, b in enumerate(bs):
+            if b.get("page") == ch["page"] and target in norm(b.get("text") or "").lower():
+                return i
+        for i, b in enumerate(bs):
+            if b.get("page") == ch["page"]:
+                return i
+        return 0
+    starts = sorted([(find_start(c), c) for c in chapters], key=lambda x: x[0])
+    sections = []
+    for k, (si, c) in enumerate(starts):
+        ei = starts[k+1][0] if k+1 < len(starts) else len(bs)
+        txt = "\n".join((bs[j].get("text") or "") for j in range(si, ei)).strip()
+        sections.append({"level": c["level"], "number": c["number"], "heading": c["heading"],
+                         "page": c["page"], "text": txt, "blocks": ei - si, "from": c["from"]})
+    if starts and starts[0][0] > 0:
+        pre = "\n".join((bs[j].get("text") or "") for j in range(0, starts[0][0])).strip()
+        if len(pre) > 80:
+            sections.insert(0, {"level": 2, "number": "", "heading": "摘要与开头",
+                                "page": 1, "text": pre, "blocks": starts[0][0], "from": "pre"})
+    empty = [s for s in sections if len(s["text"]) < 80]
+    log("  切出 %d 节（空节 %d 个）" % (len(sections), len(empty)))
+
+    # ── 图表：行首锚定 ──
+    cand = defaultdict(list)
+    CAP = re.compile(r"^\s*(Table|Figure)\s+(\d+)\s*[\.:]\s*([A-Z][^\n]{2,110})$", re.MULTILINE)
+    for pgno in range(n_pages):
+        txt = doc[pgno].get_text()
+        for m in CAP.finditer(txt):
+            kind, num, title = m.group(1), int(m.group(2)), norm(m.group(3))
+            if re.match(r"^(Table|Figure)\s+\d+\s*[\.:]", title):   # 第二道防线
+                continue
+            cand[(kind, num)].append({"page": pgno + 1, "title": title})
+
+    def score(kind, t):
+        s = 0
+        if 8 <= len(t) <= 130: s += 2
+        if t.endswith("."): s += 2
+        if re.match(r"^(This|There|It|We|The following|In this|As shown)", t, re.I): s -= 3
+        if re.search(r"(Sustainability|Energies|Water|Processes)\s+\d{4}", t): s -= 4
+        if re.match(r"^\d+ of \d+$", t): s -= 4
+        if t and t[0].isupper(): s += 1
+        return s
+
+    charts = {}
+    for (kind, num), lst in cand.items():
+        b = max(lst, key=lambda x: score(kind, x["title"]))
+        charts["%s %d" % (kind, num)] = {"kind": kind, "number": num, "page": b["page"],
+                                         "title": b["title"], "score": score(kind, b["title"]),
+                                         "candidates": len(lst)}
+    tables = {k: v for k, v in charts.items() if v["kind"] == "Table"}
+    figures = {k: v for k, v in charts.items() if v["kind"] == "Figure"}
+    low = [k for k, v in charts.items() if v["score"] < 2]
+    log("  表 %d 个 / 图 %d 个（标题可信度低：%s）" % (len(tables), len(figures), low or "无"))
+    doc.close()
+    return {"chapters_source": src, "sections": sections, "tables": tables,
+            "figures": figures, "low_conf": low, "n_pages": n_pages}
+
+
+# ══════════════════════════════════════════
+# STEP 3：渲染全部图表页
+# ══════════════════════════════════════════
+def do_render(meta, news, work):
+    sec("STEP 3：渲染图表页（不设上限）")
+    need = sorted({v["page"] for v in list(news["tables"].values()) + list(news["figures"].values())})
+    have = sorted({int(re.search(r"pg-(\d+)", f).group(1))
+                   for f in os.listdir(work) if re.search(r"pg-(\d+)", f)})
+    todo = [p for p in need if p not in have]
+    log("  需要 %d 页：%s" % (len(need), need))
+    log("  已有 %d 页，待渲染 %d 页：%s" % (len(have), len(todo), todo))
+    if todo:
+        r = subprocess.run([PY, "-W", "ignore", NORMAN, "render", meta["pdf_path"],
+                            "--pages", ",".join(map(str, todo)), "--dpi", "150",
+                            "--name", "pg", "--out", work],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           env=os.environ)
+        log("  渲染退出码 %s" % r.returncode)
+    have2 = sorted({int(re.search(r"pg-(\d+)", f).group(1))
+                    for f in os.listdir(work) if re.search(r"pg-(\d+)", f)})
+    missing = [p for p in need if p not in have2]
+    log("  %s 最终 %d 页，缺 %d 页 %s" % ("✅" if not missing else "❌", len(have2), len(missing), missing))
+    return {"pages_needed": need, "pages_rendered": have2, "pages_missing": missing}
+
+
+# ══════════════════════════════════════════
+# STEP 4：完整性报告
+# ══════════════════════════════════════════
+def build_report(meta, news, rend):
+    t, f = news["tables"], news["figures"]
+    pngs = set(rend["pages_rendered"])
+    empty = [s for s in news["sections"] if len(s["text"]) < 80]
+
+    L = []
+    L.append("### 完整性报告（自动生成，请核对）")
+    L.append("")
+    L.append("**章节来源**：%s" % news["chapters_source"])
+    L.append("")
+    L.append("| 项目 | 应有 | 已覆盖 | 缺失 |")
+    L.append("|---|---|---|---|")
+    tm = [n for n, v in t.items() if v["page"] not in pngs]
+    fm = [n for n, v in f.items() if v["page"] not in pngs]
+    L.append("| 表 | %d | %d | %s |" % (len(t), len(t) - len(tm), ", ".join(sorted(tm)) or "无"))
+    L.append("| 图 | %d | %d | %s |" % (len(f), len(f) - len(fm), ", ".join(sorted(fm)) or "无"))
+    L.append("| 章节 | %d | %d | %s |" % (
+        len(news["sections"]), len(news["sections"]) - len(empty),
+        ("空节 %d（父节无独立内容，属论文结构）" % len(empty)) if empty else "无"))
+    L.append("")
+    L.append("**图表清单**（可信度：高=标题形态正常 / 低=可能错位，需人工核对）")
+    L.append("")
+    L.append("| 编号 | 页码 | 已渲染 | 标题可信度 | 标题 |")
+    L.append("|---|---|---|---|---|")
+    for d, lab in [(t, "Table"), (f, "Figure")]:
+        for k in sorted(d, key=lambda x: d[x]["number"]):
+            v = d[k]
+            L.append("| %s %d | p%d | %s | %s | %s |" % (
+                lab, v["number"], v["page"], "✅" if v["page"] in pngs else "❌",
+                "高" if v["score"] >= 2 else "低", v["title"][:52].replace("|", "\\|")))
+    L.append("")
+    L.append("**章节清单**")
+    L.append("")
+    for s in news["sections"]:
+        L.append("- L%d %s%s（p%s，%d 字）" % (
+            s["level"], (s["number"] + " ") if s["number"] else "",
+            s["heading"], s["page"], len(s["text"])))
+    return "\n".join(L)
+
+
+# ══════════════════════════════════════════
+# STEP 5：生成 5 条笔记
+# ══════════════════════════════════════════
+def ds(system, user, max_tokens=10000, temperature=0.4, json_mode=False):
+    key = io.open(KEY_FILE, encoding="utf-8").read().strip()
+    payload = {"model": "deepseek-chat",
+               "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+               "max_tokens": max_tokens, "temperature": temperature}
+    if json_mode: payload["response_format"] = {"type": "json_object"}
+    req = urllib.request.Request("https://api.deepseek.com/v1/chat/completions",
+        data=json.dumps(payload).encode(),
+        headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=900) as r:
+        d = json.loads(r.read().decode())
+    return d["choices"][0]["message"]["content"], d.get("usage", {})
+
+
+def parse_json(raw):
+    t = raw.strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-z]*\n?", "", t); t = re.sub(r"\n?```$", "", t)
+    return json.loads(t)
+
+
+import urllib.request
+
+
+def do_notes(meta, sm, news, work):
+    sec("STEP 5：生成 5 条笔记")
+    blocks = sm["blocks"]
+    fulltext = "\n".join((b.get("text") or "") for b in blocks)
+    BASE = """论文：%s
+作者：%s
+年份：%s　期刊：%s　DOI：%s
+
+摘要：
+%s
+
+""" % (meta["title"], meta["authors"], meta["year"], meta["venue"], meta["doi"], meta["abstract"][:1200])
+    res = {}
+
+    def trunc(n):
+        return fulltext[:n]
+
+    # ①
+    log("  ① 飞书速览 ...")
+    S1 = """你是学术论文信息提取专家。用飞书「AI 文献批量速读模版」19 项结构填满。
+规则：缺失填「未提及」，禁止编造；中文；禁解释性描述；数字要具体；只输出 Markdown。
+标题原样保留：
+# 飞书速览：{一句话中文结论}
+## 一、基础信息
+1、英文标题： 2、中文标题： 3、作者： 4、期刊名称： 5、发表年份：
+6、摘要：（完整中文翻译） 7、关键词：
+## 二、核心内容
+8、核心论点： 9、研究目标： 10、研究问题：
+11、研究设计：（数据来源/样本/时间跨度/识别策略/变量测度）
+12、理论机制： 13、研究结论：（含具体系数与显著性） 14、理论贡献：
+## 三、评判与延伸
+15、局限性： 16、应用价值： 17、文献综述： 18、学术对话： 19、未来选题："""
+    r, u = ds(S1, BASE + "正文：\n" + trunc(50000), 9000, 0.3)
+    res["note1"] = r
+    log("     %d 字" % len(r))
+
+    # ②
+    log("  ② 证据链 ...")
+    K = re.compile(r"(Table\s*\d|Figure\s*\d|0\.\d{2,}|%|p\s*<\s*0|significant|robustness|hypothes)", re.I)
+    kb = [b for b in blocks if K.search(b.get("text") or "") and len(b.get("text") or "") > 40]
+    kb.sort(key=lambda b: (-len(re.findall(r"\d", b.get("text") or "")), b["id"]))
+    picked = sorted(kb[:110], key=lambda b: b["id"])
+    corpus = "\n".join("[%s] (p%s) %s" % (b["id"], b.get("page"), (b.get("text") or "").replace("\n", " ")) for b in picked)
+    S2 = """你是严格的事实核查员。生成 claims/evidence/links/branches/actions。
+硬约束：source_ids 必须从给定 block id 里选，不许编造；locator 写 "PDF page N" 或 "PDF page N, 表 M"；
+claims.origin ∈ paper_fact/interpretation/my_critique；evidence.inspection ∈ verified/not_visual_checked/unavailable；
+links.relation ∈ supports/limits/contradicts/mixed；每条 claim 必须有 caveat；每条 link 必须有 rationale。
+输出 JSON：
+{"claims":[{"id":"C01","statement":"","origin":"paper_fact","caveat":""}],
+ "evidence":[{"id":"E01","kind":"table|text|figure","locator":"","source_ids":[""],"observation":"","inspection":"verified"}],
+ "links":[{"claim_id":"C01","evidence_id":"E01","relation":"supports","strength":"strong|moderate|weak","rationale":""}],
+ "branches":[{"id":"B01","question":"","why":"","difficulty":"high|medium|low","data_needed":""}],
+ "actions":[{"id":"A01","action":"","rationale":"","evidence_ids":["E01"],"priority":"high|medium|low"}]}
+目标：7-10 claims / 8-11 evidence / 9-13 links / 4-6 branches / 4-6 actions。"""
+    r2, u2 = ds(S2, "论文：%s\n\n文本块：\n%s" % (meta["title"], corpus), 9000, 0.3, True)
+    try:
+        ev = parse_json(r2)
+        valid = {b["id"] for b in blocks}
+        for e in (ev.get("evidence") or []):
+            good = [s for s in (e.get("source_ids") or []) if s in valid]
+            e["source_ids"] = good
+            if not good: e["inspection"] = "unavailable"
+        res["evidence"] = ev
+        log("     %d claims / %d evidence / %d links" % (
+            len(ev.get("claims") or []), len(ev.get("evidence") or []), len(ev.get("links") or [])))
+    except Exception as e:
+        log("     ❌ %s" % str(e)[:100])
+        res["evidence"] = {"claims": [], "evidence": [], "links": [], "branches": [], "actions": []}
+
+    # ③
+    log("  ③ 逐节精读 ...")
+    S3 = """为论文每一节写「摘要 + 评析」。
+summary 只复述（含数字/表号/方法名）；analysis 才评判（证据强度/假设/局限）。
+禁止「不是…而是…」句式；禁止第一人称；见不到内容的写「该节提取到的文本不足」。
+输出 JSON：{"sections":[{"heading":"","summary":"","analysis":""}]}
+heading 必须与输入逐字一致、顺序一致。"""
+    out = []
+    B = 4
+    sects = news["sections"]
+    for bi in range(0, len(sects), B):
+        batch = sects[bi:bi+B]
+        items = "\n\n---\n\n".join("[%d] heading=%s | page=%s\n%s" % (
+            bi+j, s["heading"], s["page"], s["text"][:2600]) for j, s in enumerate(batch))
+        try:
+            r3, _ = ds(S3, "论文：%s\n\n%s" % (meta["title"], items), 6000, 0.3, True)
+            got = parse_json(r3).get("sections") or []
+            for j, g in enumerate(got):
+                if bi + j < len(sects):
+                    s = sects[bi+j]
+                    out.append({"number": s["number"], "heading": s["heading"], "page": s["page"],
+                                "level": s["level"], "summary": g.get("summary", ""),
+                                "analysis": g.get("analysis", "")})
+            while len(out) < bi + len(batch):
+                s = sects[len(out)]
+                out.append({"number": s["number"], "heading": s["heading"], "page": s["page"],
+                            "level": s["level"], "summary": "该节提取到的文本不足，无法判断。",
+                            "analysis": "生成阶段未返回该节内容。"})
+            log("     批次 %d/%d ✅" % (bi//B+1, (len(sects)+B-1)//B))
+        except Exception as e:
+            log("     批次 %d/%d ❌ %s" % (bi//B+1, (len(sects)+B-1)//B, str(e)[:60]))
+            for j in range(len(batch)):
+                s = sects[bi+j]
+                out.append({"number": s["number"], "heading": s["heading"], "page": s["page"],
+                            "level": s["level"], "summary": "该节生成失败。",
+                            "analysis": "生成异常：%s" % str(e)[:60]})
+    res["sections"] = out
+    log("     共 %d 节" % len(out))
+
+    # ④
+    log("  ④ 零基础拆解 ...")
+    S4 = """你擅长把论文讲给外行听，同时能还原作者决策过程。
+读者：刚入学的硕士生，本科非本专业，第一次系统读文献。
+铁律一：从生活经验出发；术语先大白话解释再给名字；禁止要求读者自行翻译的句子；
+       不用「输入/组件/反馈/风险」代替具体对象和动作。
+铁律二：每处回答「他为什么这么干」而不是只答「他干了什么」。
+铁律三：区分「论文实测的」「作者说的」「我推测的」，推测必须标「推断」。
+标题原样保留：
+# 零基础拆解：{一句话结论}
+## 0. 先用一个日常场景说明这篇论文在干什么
+## 1. 作者当时面对什么
+### 1.1 这个领域当时在做什么
+### 1.2 卡在哪里（具体困难）
+### 1.3 作者手里有什么
+### 1.4 如果他不写这篇，会缺什么
+### 1.5 为什么选这条路而不是别的（表格：备选方案/代价/作者为什么没选）
+## 2. 论文的骨架：每小节为什么这么写
+## 3. 核心机制讲透
+## 4. 关键句子为什么这么写
+## 5. 图表为什么画这个
+## 6. 数字到底在说什么
+## 7. 这篇论文的边界
+## 8. 现在你能自己解释什么
+## 作者意图推断声明"""
+    r4, _ = ds(S4, BASE + "正文：\n" + trunc(50000), 12000, 0.5)
+    res["note4"] = r4
+    log("     %d 字" % len(r4))
+
+    # ⑤
+    log("  ⑤ 决策地图 ...")
+    S5A = """你是「论文作者决策侦查员」。找出这篇论文里所有「作者本可以选别的，但他选了这个」的决策点。
+不要套预设分类。什么算：有真实备选方案 且 换了备选结论/贡献/可信度会实质变化。
+什么不算：「按惯例就该这么做」/「数据只能这么拿」/ 纯写作风格 / 插值补缺失 / 软件版本。
+每条给出：id / decision（具体，不许写类名）/ alternatives / forgone / why_not_others /
+evidence_strength(explicit|inferred|guess) / impact / importance(1-5)。
+排序：按重要性降序。数量由论文决定。
+输出 JSON：{"decisions":[...], "count_note":"为什么是这么多个，不是更多或更少"}"""
+    r5a, _ = ds(S5A, "论文：%s\n\n正文：\n%s" % (meta["title"], trunc(48000)), 8000, 0.3, True)
+    try:
+        dec = parse_json(r5a)
+        dl = dec.get("decisions") or []
+        res["decisions"] = dec
+        log("     %d 个决策点" % len(dl))
+    except Exception as e:
+        log("     ❌ %s" % str(e)[:80])
+        res["decisions"] = {"decisions": []}
+        dl = []
+
+    if dl:
+        dtxt = "\n\n".join("【%s｜重要度%s】%s\n  备选：%s\n  放弃：%s\n  依据(%s)：%s\n  影响：%s" % (
+            d.get("id"), d.get("importance"), d.get("decision"),
+            " / ".join(d.get("alternatives") or []), d.get("forgone"),
+            d.get("evidence_strength"), d.get("why_not_others"), d.get("impact")) for d in dl)
+        S5B = """你按「作者决策点清单」组织笔记（清单来自论文本身，不是预设分类）。
+结构由清单决定，不要套固定章节名。每个决策标题用它自己的内容，不许用类名。
+零基础能懂：术语先大白话解释再给名字；禁止要求读者自行翻译。
+每个决策回答五件事：他当时面对的局面 → 选了什么放弃什么 → 为什么这么选 → 换成备选会怎样 → 最容易被审稿人追问什么。
+严格区分：论文实测的 / 作者说的 / 你推测的（推测标「推断」）。不许编造作者心理。
+标题原样保留：
+# 作者决策地图：{一句话说清这篇论文靠哪几个选择撑起来}
+## 先用一个日常场景说清这篇论文在干什么
+## 这篇论文的决策地图
+（表格：决策点/一句话/放弃什么/影响哪里/依据强度）
+## 决策一：{用决策点内容命名}
+### 他当时面对的局面
+### 他选了什么，放弃了什么
+### 为什么这么选（依据来自哪里）
+### 如果换成备选方案，这篇论文会变成什么样
+### 这里最容易被审稿人追问什么
+（决策二到决策N，同样）
+## 这些决策串起来，构成了什么样的论文
+## 读者现在能自己回答什么
+## 我的推断与依据强度
+最后一行原样输出：以上拆解基于论文文本，作者真实动机只能从文本反推，无法完全确认。"""
+        r5b, _ = ds(S5B, "论文：%s\n\n=== 决策点清单 ===\n%s\n\n=== 正文 ===\n%s" % (
+            meta["title"], dtxt, trunc(38000)), 14000, 0.5)
+        res["note5"] = r5b
+        log("     %d 字" % len(r5b))
+
+    io.open(os.path.join(work, "notes.json"), "w", encoding="utf-8").write(
+        json.dumps(res, ensure_ascii=False, indent=1))
+    return res
+
+
+# ══════════════════════════════════════════
+# STEP 6：写进 Zotero
+# ══════════════════════════════════════════
+def call(name, args, timeout=600):
+    global _rid
+    _rid += 1
+    body = json.dumps({"jsonrpc": "2.0", "id": _rid, "method": "tools/call",
+                       "params": {"name": name, "arguments": args}}).encode()
+    req = urllib.request.Request(MCP, data=body,
+        headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+        method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read().decode("utf-8", errors="replace")
+    if raw.startswith("event:") or "data: " in raw[:100]:
+        for line in raw.split("\n"):
+            if line.startswith("data: "):
+                raw = line[6:]; break
+    j = json.loads(raw)
+    if "error" in j: return {"error": j["error"]}
+    content = j.get("result", {}).get("content") or []
+    txt = "\n".join(c.get("text", "") for c in content if c.get("type") == "text")
+    try: return json.loads(txt)
+    except Exception: return {"_text": txt}
+
+
+_rid = 0
+
+
+def md2html(md):
+    import html as H
+    def esc(s): return H.escape(str(s or ""), quote=False)
+    def inl(s):
+        s = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", s)
+        s = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<em>\1</em>", s)
+        s = re.sub(r"`([^`]+)`", r"<code>\1</code>", s)
+        return s
+    lines = md.split("\n"); out = []; i = 0
+    inc = False; cbuf = []
+    while i < len(lines):
+        s = lines[i].rstrip()
+        if s.strip().startswith("```"):
+            if not inc: inc = True; cbuf = []
+            else:
+                inc = False; out.append("<pre><code>%s</code></pre>" % esc("\n".join(cbuf)))
+            i += 1; continue
+        if inc: cbuf.append(lines[i]); i += 1; continue
+        if not s.strip(): i += 1; continue
+        if s.strip().startswith("|") and s.strip().endswith("|"):
+            tbl = []
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                tbl.append(lines[i].strip()); i += 1
+            rows = []
+            for r in tbl:
+                cs = [c.strip() for c in r.strip("|").split("|")]
+                if all(re.fullmatch(r":?-{2,}:?", c or "-") for c in cs): continue
+                rows.append(cs)
+            if rows:
+                out.append('<table border="1" cellspacing="0" cellpadding="6" style="border-collapse:collapse;width:100%">')
+                for ri, r in enumerate(rows):
+                    tg = "th" if ri == 0 else "td"
+                    out.append("<tr>" + "".join("<%s>%s</%s>" % (tg, inl(esc(c)), tg) for c in r) + "</tr>")
+                out.append("</table>")
+            continue
+        m = re.match(r"^(#{1,6})\s+(.+)$", s)
+        if m:
+            lv = len(m.group(1)); out.append("<h%d>%s</h%d>" % (lv, inl(esc(m.group(2))), lv)); i += 1; continue
+        if s.strip().startswith(">"):
+            buf = []
+            while i < len(lines) and lines[i].strip().startswith(">"):
+                buf.append(lines[i].strip()[1:].strip()); i += 1
+            out.append("<blockquote>%s</blockquote>" % inl(esc(" ".join(buf)))); continue
+        if re.fullmatch(r"-{3,}", s.strip()):
+            out.append("<hr/>"); i += 1; continue
+        if re.match(r"^[-*+]\s+", s):
+            it = []
+            while i < len(lines) and re.match(r"^[-*+]\s+", lines[i]):
+                it.append(re.sub(r"^[-*+]\s+", "", lines[i].strip())); i += 1
+            out.append("<ul>" + "".join("<li>%s</li>" % inl(esc(x)) for x in it) + "</ul>"); continue
+        if re.match(r"^\d+\.\s+", s):
+            it = []
+            while i < len(lines) and re.match(r"^\d+\.\s+", lines[i]):
+                it.append(re.sub(r"^\d+\.\s+", "", lines[i].strip())); i += 1
+            out.append("<ol>" + "".join("<li>%s</li>" % inl(esc(x)) for x in it) + "</ol>"); continue
+        buf = []
+        while i < len(lines) and lines[i].strip() and \
+                not re.match(r"^(#{1,6}\s|[-*+]\s|\d+\.\s|>|\||```)", lines[i].strip()):
+            buf.append(lines[i].strip()); i += 1
+        if buf: out.append("<p>%s</p>" % inl(esc(" ".join(buf))))
+    return "\n".join(out)
+
+
+def do_write(meta, notes, news, rend, report_md, work):
+    import html as H
+    sec("STEP 6：写进 Zotero")
+    parent = meta["parent_key"]
+
+    # 1. 图片导入
+    pngs = sorted([f for f in os.listdir(work) if f.lower().endswith(".png")])
+    log("  导入 %d 张图..." % len(pngs))
+    for f in pngs:
+        m = re.search(r"pg-(\d+)", f)
+        pg = int(m.group(1)) if m else 0
+        call("write_item", {"action": "import", "parentItemKey": parent,
+                            "filePath": os.path.join(work, f),
+                            "title": "PDF p%d" % pg})
+        time.sleep(0.2)
+
+    # 2. 回查真 key
+    tmp = os.path.join(TMP, "_suite_verify")
+    if os.path.isdir(tmp): shutil.rmtree(tmp)
+    os.makedirs(tmp)
+    for fn in ["zotero.sqlite", "zotero.sqlite-wal", "zotero.sqlite-shm"]:
+        p = os.path.join(ZOTERO, fn)
+        if os.path.exists(p): shutil.copy2(p, os.path.join(tmp, fn))
+    conn = sqlite3.connect(os.path.join(tmp, "zotero.sqlite"))
+    cur = conn.cursor()
+    cur.execute("""SELECT a.key, ia.path FROM itemAttachments ia
+                   JOIN items a ON a.itemID=ia.itemID
+                   JOIN items p ON p.itemID=ia.parentItemID
+                   WHERE p.key=? AND ia.contentType='image/png'""", (parent,))
+    keymap = {}
+    real = set()
+    for k, path in cur.fetchall():
+        rel = str(path).replace("storage:", "")
+        mm = re.search(r"pg-(\d+)", rel)
+        if mm:
+            keymap[int(mm.group(1))] = k
+            real.add(k)
+    conn.close()
+    log("  数据库真实图片 key: %d 个" % len(real))
+
+    def img_for(pages):
+        ps = []
+        for pg in pages:
+            if pg in keymap:
+                ps.append('<p><img alt="PDF page %d" width="1241" height="1754" data-attachment-key="%s"></p>'
+                          % (pg, keymap[pg]))
+        return "\n".join(ps)
+
+    chart_pages = sorted(set(rend["pages_rendered"]))
+    report_html = md2html(report_md)
+
+    def hdr(badge, source, extra):
+        return '<h1>%s</h1><p><strong>%s</strong></p><p>%s</p><hr/>' % (
+            H.escape(badge, quote=False), H.escape(source, quote=False), H.escape(extra, quote=False))
+
+    created = []
+    # ①
+    if notes.get("note1"):
+        body = hdr("【① 飞书模版 · 速览】" + meta["title"],
+                   "来源：飞书「AI 文献批量速读模版2.0」19 项结构",
+                   "定位：快速过一遍。") + report_html + "<hr/>" + md2html(notes["note1"])
+        body += "\n<hr/><h2>附：图表页原图</h2>\n" + img_for(chart_pages)
+        r = call("write_note", {"action": "create", "parentKey": parent, "content": body,
+                                "tags": ["飞书模版", "①速览", "19项"]})
+        k = (r.get("data") or {}).get("noteKey")
+        log("  %s ① %s" % ("✅" if k else "❌", k))
+        if k: created.append(("①", k, len(body)))
+
+    # ②
+    ev = notes.get("evidence") or {}
+    if ev.get("claims"):
+        P = ["<h2>证据卡：论断与证据</h2>"]
+        emap = {e["id"]: e for e in (ev.get("evidence") or [])}
+        lmap = {}
+        for l in (ev.get("links") or []):
+            lmap.setdefault(l.get("claim_id"), []).append(l)
+        for c in (ev.get("claims") or []):
+            P.append("<h3>%s（%s）</h3>" % (H.escape(c.get("id", ""), quote=False), H.escape(c.get("origin", ""), quote=False)))
+            P.append("<p><strong>陈述</strong>：%s</p>" % H.escape(c.get("statement", ""), quote=False))
+            P.append("<p><strong>边界</strong>：%s</p>" % H.escape(c.get("caveat", ""), quote=False))
+            for l in lmap.get(c.get("id"), []):
+                e = emap.get(l.get("evidence_id")) or {}
+                P.append("<p><strong>证据 %s</strong>（%s）｜%s（%s）：%s</p>" % (
+                    H.escape(e.get("id", ""), quote=False), H.escape(e.get("locator", ""), quote=False),
+                    H.escape(l.get("relation", ""), quote=False), H.escape(l.get("strength", ""), quote=False),
+                    H.escape(l.get("rationale", ""), quote=False)))
+        P.append("<h2>未来研究洞察</h2><ul>")
+        for b in (ev.get("branches") or []):
+            P.append("<li><strong>%s</strong>：%s</li>" % (
+                H.escape(b.get("id", ""), quote=False), H.escape(b.get("question", ""), quote=False)))
+        P.append("</ul><h2>下一步动作</h2><ul>")
+        for a in (ev.get("actions") or []):
+            P.append("<li><strong>%s</strong>：%s</li>" % (
+                H.escape(a.get("id", ""), quote=False), H.escape(a.get("action", ""), quote=False)))
+        P.append("</ul>")
+        body = hdr("【② 证据链】" + meta["title"],
+                   "来源：%d blocks → %d claims / %d evidence / %d links" % (
+                       len(news["sections"]), len(ev.get("claims") or []),
+                       len(ev.get("evidence") or []), len(ev.get("links") or [])),
+                   "每条论断钉在具体 block 上。") + report_html + "<hr/>" + "\n".join(P)
+        body += "\n<hr/><h2>附：图表页原图</h2>\n" + img_for(chart_pages)
+        r = call("write_note", {"action": "create", "parentKey": parent, "content": body,
+                                "tags": ["证据链", "②Norman", "可校验"]})
+        k = (r.get("data") or {}).get("noteKey")
+        log("  %s ② %s" % ("✅" if k else "❌", k))
+        if k: created.append(("②", k, len(body)))
+
+    # ③
+    ss = notes.get("sections") or []
+    if ss:
+        P = ["<h2>逐节精读（%d 节）</h2>" % len(ss)]
+        for s in ss:
+            P.append("<h3>%s%s（p%s）</h3>" % (
+                (H.escape(str(s["number"]) + " ", quote=False)) if s.get("number") else "",
+                H.escape(s.get("heading", ""), quote=False), H.escape(str(s.get("page", "")), quote=False)))
+            P.append("<p><strong>该节说什么</strong>：%s</p>" % H.escape(s.get("summary", ""), quote=False))
+            P.append("<p><strong>该节是否站得住</strong>：%s</p>" % H.escape(s.get("analysis", ""), quote=False))
+        body = hdr("【③ 精读笔记 · 逐节 %d 节】" % len(ss) + meta["title"],
+                   "来源：%s" % news["chapters_source"],
+                   "定位：看每一节怎么论证、哪里站不住。") + report_html + "<hr/>" + "\n".join(P)
+        body += "\n<hr/><h2>附：图表页原图</h2>\n" + img_for(chart_pages)
+        r = call("write_note", {"action": "create", "parentKey": parent, "content": body,
+                                "tags": ["精读", "③逐节", "%d节" % len(ss)]})
+        k = (r.get("data") or {}).get("noteKey")
+        log("  %s ③ %s" % ("✅" if k else "❌", k))
+        if k: created.append(("③", k, len(body)))
+
+    # ④
+    if notes.get("note4"):
+        body = hdr("【④ 零基础拆解 · 作者视角】" + meta["title"],
+                   "来源：ljg-paper 方法论（lijigang/ljg-skills, MIT）+ 作者决策重建层",
+                   "读者：刚入学的硕士生，本科非本专业。") + report_html + "<hr/>" + md2html(notes["note4"])
+        body += "\n<hr/><h2>附：图表页原图</h2>\n" + img_for(chart_pages)
+        r = call("write_note", {"action": "create", "parentKey": parent, "content": body,
+                                "tags": ["零基础拆解", "④作者视角", "硕士入门"]})
+        k = (r.get("data") or {}).get("noteKey")
+        log("  %s ④ %s" % ("✅" if k else "❌", k))
+        if k: created.append(("④", k, len(body)))
+
+    # ⑤
+    dec = notes.get("decisions") or {}
+    if notes.get("note5"):
+        cnt = Counter(d.get("evidence_strength") for d in (dec.get("decisions") or []))
+        ex = "<p><strong>做法：先从论文侦查出决策点（本文 %d 个），再按决策点组织。结构因论文而异。</strong></p>" % len(dec.get("decisions") or [])
+        ex += "<p>依据强度：explicit %d / inferred %d / guess %d</p>" % (
+            cnt.get("explicit", 0), cnt.get("inferred", 0), cnt.get("guess", 0))
+        body = hdr("【⑤ 决策地图 · 按这篇论文自己的选择组织】" + meta["title"],
+                   "来源：决策侦查 + 决策驱动组织（两步，非固定章节）",
+                   "") + ex + report_html + "<hr/>" + md2html(notes["note5"])
+        body += "\n<hr/><h2>附：图表页原图</h2>\n" + img_for(chart_pages)
+        r = call("write_note", {"action": "create", "parentKey": parent, "content": body,
+                                "tags": ["决策地图", "⑤作者决策", "%d个决策点" % len(dec.get("decisions") or [])]})
+        k = (r.get("data") or {}).get("noteKey")
+        log("  %s ⑤ %s" % ("✅" if k else "❌", k))
+        if k: created.append(("⑤", k, len(body)))
+
+    # 3. 验证假 key
+    log("")
+    log("  验证：回查每条笔记的图片 key")
+    tmp2 = os.path.join(TMP, "_suite_final")
+    if os.path.isdir(tmp2): shutil.rmtree(tmp2)
+    os.makedirs(tmp2)
+    for fn in ["zotero.sqlite", "zotero.sqlite-wal", "zotero.sqlite-shm"]:
+        p = os.path.join(ZOTERO, fn)
+        if os.path.exists(p): shutil.copy2(p, os.path.join(tmp2, fn))
+    conn = sqlite3.connect(os.path.join(tmp2, "zotero.sqlite"))
+    cur = conn.cursor()
+    for label, k, ln in created:
+        cur.execute("SELECT note FROM itemNotes n JOIN items i ON i.itemID=n.itemID WHERE i.key=?", (k,))
+        r = cur.fetchone()
+        if not r: continue
+        note = r[0]
+        used = set(re.findall(r'data-attachment-key="([A-Z0-9]+)"', note))
+        fake = used - real
+        log("    %s %-11s %7d 字符  img=%d 假key=%d %s" % (
+            label, k, ln, note.count("<img"), len(fake), "✅" if not fake else "⚠️" + str(fake)))
+    conn.close()
+    return created
+
+
+# ══════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("item_key")
+    ap.add_argument("--work", default=None)
+    ap.add_argument("--skip-notes", action="store_true", help="只做检测，不生成笔记")
+    ap.add_argument("--skip-write", action="store_true", help="不写进 Zotero")
+    args = ap.parse_args()
+
+    work = args.work or os.path.join(r"F:\咨询\_test_butler", "_suite_" + args.item_key)
+    os.makedirs(work, exist_ok=True)
+    log("工作目录：%s" % work)
+    t_all = time.time()
+
+    meta = load_zotero(args.item_key, work)
+    sm = do_extract(meta, work)
+    news = do_detect(meta, sm, work)
+    rend = do_render(meta, news, work)
+    report = build_report(meta, news, rend)
+
+    sec("完整性报告")
+    log(report)
+    io.open(os.path.join(work, "completeness.md"), "w", encoding="utf-8").write(report)
+    io.open(os.path.join(work, "completeness.json"), "w", encoding="utf-8").write(
+        json.dumps({"meta": meta,
+                    "chapters_source": news["chapters_source"],
+                    "sections": [{k: v for k, v in s.items() if k != "text"} for s in news["sections"]],
+                    "tables": news["tables"], "figures": news["figures"],
+                    "render": rend, "low_conf": news["low_conf"]},
+                   ensure_ascii=False, indent=1, default=str))
+
+    if args.skip_notes:
+        log("")
+        log("（--skip-notes）跳过笔记生成")
+        log("总耗时 %.1f 秒" % (time.time()-t_all))
+        return
+
+    notes = do_notes(meta, sm, news, work)
+    if args.skip_write:
+        log("")
+        log("（--skip-write）跳过写库")
+        log("总耗时 %.1f 秒" % (time.time()-t_all))
+        return
+
+    created = do_write(meta, notes, news, rend, report, work)
+
+    sec("完成")
+    for label, k, ln in created:
+        log("  %s  %-11s %8d 字符" % (label, k, ln))
+    log("  共 %d 条笔记" % len(created))
+    log("  总耗时 %.1f 秒" % (time.time()-t_all))
+
+
+if __name__ == "__main__":
+    main()

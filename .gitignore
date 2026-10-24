@@ -1,0 +1,16 @@
+# 工作目录（含渲染的 PNG、source_map.json 等中间产物）
+_suite_*/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# 密钥 —— 绝对不要提交
+*.key
+.secrets/
+.env
+
+# 系统
+.DS_Store
+Thumbs.db
