@@ -259,16 +259,29 @@ def do_detect(meta, sm, work):
     empty = [s for s in sections if len(s["text"]) < 80]
     log("  切出 %d 节（空节 %d 个）" % (len(sections), len(empty)))
 
-    # ── 图表：行首锚定 ──
+    # ── 图表识别：两阶段 ──
+    # 阶段 1（严格）：caption 必须在行首。准确率高，能避开正文引用
+    #   （"as shown in Table 2. The results indicate..." 不是 caption）。
+    # 阶段 2（兜底）：只在编号有缺口时，对缺失的那些编号放宽行首要求。
+    #   原因：caption 常和表格挤在同一行，例如
+    #   "| Overall change | Figure 4. Decomposition results of ..."（Li 2021 实测）。
+    #
+    # 两个阶段都必须保证「标题在同一行」（[^\n]），这才能防住跨行抢标题：
+    #   p11 的 "shown in Figure 7 and Table 7." 行末后，下一行是
+    #   "Figure 6. The Sankey..."，允许跨行就会把 Figure 6 的标题抢给 Table 7。
     cand = defaultdict(list)
-    CAP = re.compile(r"^\s*(Table|Figure)\s+(\d+)\s*[\.:]\s*([A-Z][^\n]{2,110})$", re.MULTILINE)
+    CAP_STRICT = re.compile(r"^\s*(Table|Figure)\s+(\d+)\s*[\.:]\s*([A-Z][^\n]{2,110})$", re.MULTILINE)
+    CAP_LOOSE = re.compile(r"(Table|Figure)\s+(\d+)\s*[\.:]\s*([A-Z][^\n]{2,110})")
+
+    def add_cand(kind, num, title, page):
+        title = norm(title)
+        if re.match(r"^(Table|Figure)\s+\d+\s*[\.:]", title):   # 第二道防线
+            return
+        cand[(kind, num)].append({"page": page, "title": title})
+
     for pgno in range(n_pages):
-        txt = doc[pgno].get_text()
-        for m in CAP.finditer(txt):
-            kind, num, title = m.group(1), int(m.group(2)), norm(m.group(3))
-            if re.match(r"^(Table|Figure)\s+\d+\s*[\.:]", title):   # 第二道防线
-                continue
-            cand[(kind, num)].append({"page": pgno + 1, "title": title})
+        for m in CAP_STRICT.finditer(doc[pgno].get_text()):
+            add_cand(m.group(1), int(m.group(2)), m.group(3), pgno + 1)
 
     def score(kind, t):
         s = 0
@@ -280,19 +293,67 @@ def do_detect(meta, sm, work):
         if t and t[0].isupper(): s += 1
         return s
 
-    charts = {}
-    for (kind, num), lst in cand.items():
-        b = max(lst, key=lambda x: score(kind, x["title"]))
-        charts["%s %d" % (kind, num)] = {"kind": kind, "number": num, "page": b["page"],
-                                         "title": b["title"], "score": score(kind, b["title"]),
-                                         "candidates": len(lst)}
+    def build_charts():
+        out = {}
+        for (kind, num), lst in cand.items():
+            b = max(lst, key=lambda x: score(kind, x["title"]))
+            out["%s %d" % (kind, num)] = {"kind": kind, "number": num, "page": b["page"],
+                                          "title": b["title"], "score": score(kind, b["title"]),
+                                          "candidates": len(lst)}
+        return out
+
+    charts = build_charts()
+
+    # ── 编号连续性检查 ──
+    # 报告里「表 N/N 已覆盖」只证明「识别到的都渲染了」，**不能证明没有漏识别**。
+    # 所以再扫一遍全文所有 Table N / Figure N 的编号，和识别结果做差集。
+    seen_nums = defaultdict(set)   # kind -> set(nums)
+    loose = re.compile(r"(Table|Figure)\s+(\d+)")
+    for pgno in range(n_pages):
+        for m in loose.finditer(doc[pgno].get_text()):
+            seen_nums[m.group(1)].add(int(m.group(2)))
+
+    def compute_gaps(chs):
+        g = {}
+        for kind in ("Table", "Figure"):
+            got = {v["number"] for v in chs.values() if v["kind"] == kind}
+            allnums = seen_nums.get(kind, set())
+            if got:
+                top = max(got)
+                miss = sorted(n for n in allnums if n < top and n not in got)
+            else:
+                miss = sorted(allnums)
+            if miss:
+                g[kind] = {"missing": miss, "all_numbers": sorted(allnums), "detected": sorted(got)}
+        return g
+
+    gaps = compute_gaps(charts)
+
+    # 阶段 2：对缺口的编号用宽松规则补
+    if gaps:
+        need = {(k, n) for k, g in gaps.items() for n in g["missing"]}
+        log("  编号有缺口，用宽松规则补：%s" % sorted("%s %d" % x for x in need))
+        for pgno in range(n_pages):
+            txt = doc[pgno].get_text()
+            for m in CAP_LOOSE.finditer(txt):
+                kind, num = m.group(1), int(m.group(2))
+                if (kind, num) in need:
+                    add_cand(kind, num, m.group(3), pgno + 1)
+        charts = build_charts()
+        gaps = compute_gaps(charts)
+        for kind, g in gaps.items():
+            log("  ⚠️ %s 仍缺号 %s（全文出现过 %s）" % (kind, g["missing"], g["all_numbers"]))
+        if not gaps:
+            log("  ✅ 兜底后编号已连续")
+
     tables = {k: v for k, v in charts.items() if v["kind"] == "Table"}
     figures = {k: v for k, v in charts.items() if v["kind"] == "Figure"}
     low = [k for k, v in charts.items() if v["score"] < 2]
+
     log("  表 %d 个 / 图 %d 个（标题可信度低：%s）" % (len(tables), len(figures), low or "无"))
     doc.close()
     return {"chapters_source": src, "sections": sections, "tables": tables,
-            "figures": figures, "low_conf": low, "n_pages": n_pages}
+            "figures": figures, "low_conf": low, "n_pages": n_pages, "gaps": gaps}
 
 
 # ══════════════════════════════════════════
@@ -363,6 +424,22 @@ def build_report(meta, news, rend):
         len(news["sections"]), len(news["sections"]) - len(empty),
         ("空节 %d（父节无独立内容，属论文结构）" % len(empty)) if empty else "无"))
     L.append("")
+
+    # 编号连续性：这一节才能回答「有没有漏识别」。
+    # 上面的表格只证明「识别到的都渲染了」，不能证明没有漏。
+    gaps = news.get("gaps") or {}
+    L.append("**编号连续性检查**（这才是「有没有漏识别」的证据）")
+    L.append("")
+    if gaps:
+        for kind, g in gaps.items():
+            L.append("- ⚠️ **%s 缺号**：识别到 %s，缺 **%s**（全文出现过的编号：%s）"
+                     % (kind, g["detected"], g["missing"], g["all_numbers"]))
+        L.append("")
+        L.append("  缺号通常意味着 caption 排版形态异常（和表格挤在一行，或用了别的写法），脚本没认出来。**建议人工翻到对应页核对。**")
+    else:
+        L.append("- ✅ 表、图的编号都连续，没有缺号")
+    L.append("")
+
     L.append("**图表清单**（可信度：高=标题形态正常 / 低=可能错位，需人工核对）")
     L.append("")
     L.append("| 编号 | 页码 | 已渲染 | 标题可信度 | 标题 |")
