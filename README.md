@@ -394,6 +394,54 @@ python bin/paper_reading_suite.py <Zotero父条目key>
 
 ---
 
+
+## 笔记里看不到图？先看这一节
+
+**症状：** 笔记写进 Zotero 了，但图片位置是空的；数据库里 `data-attachment-key` 都在、磁盘文件也在。
+
+**原因：** Zotero 渲染笔记图片时，不只看 key 和文件，还校验 `itemAttachments` 表的三项：
+
+| 字段 | 正常值 | 没就绪时 |
+|---|---|---|
+| `syncState` | `2` | `0` |
+| `storageHash` | 文件的 MD5 | `NULL` |
+| `storageModTime` | 文件 mtime（毫秒） | `NULL` |
+
+**这三项没就绪 → 图不显示。** Zotero 通常会异步补齐，但通过 MCP `write_item` 导入的附件有时不会被处理到。
+
+**⭐⭐ 实测过的证据（2026-10-25）：**
+
+```
+Jia 2022 / Cheng 2023 / Dai 2025  →  17 张图，syncState 全是 2，storageHash 都有值  ✅ 能显示
+Li 2021                           →   6 张图，syncState 全是 0，storageHash 全是 NULL ❌ 不显示
+```
+
+两边的 `<img>` 标签**结构完全一致**（同样无 src、同样 1241×1754），差别只在这三个字段。
+
+### 怎么修
+
+**第 1 步：先重启 Zotero。** 它启动时会扫描 storage，多数情况能自己补上。
+
+**第 2 步：还不行就手动修（必须先把 Zotero 完全退出）：**
+
+```bash
+python bin/paper_reading_suite.py <任意条目key> --fix-storage
+```
+
+它会：
+- 检查 Zotero 是否已关闭（没关就拒绝执行，避免被覆盖）
+- 找出所有 `syncState=0` 或 `storageHash=NULL` 的图片附件
+- 算文件 MD5 写入 `storageHash`、写入 `storageModTime`、设 `syncState=2`
+- 修完提示你重启 Zotero
+
+**⭐⭐ 脚本现在也会自动检查：** 每次写库后都会查一遍 storage 索引，没就绪就直接告诉你要重启 Zotero 或跑 `--fix-storage`，不会让你对着空白图猜。
+
+### 为什么脚本不自动修
+
+**因为 Zotero 正在运行时改数据库，记录会被它覆盖。** 只在确认 Zotero 已关闭时改，才不会白改。
+
+---
+
 ## 图片写入 Zotero 的唯一可行格式
 
 这一条踩了 6 轮坑，单独写出来：

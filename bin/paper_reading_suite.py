@@ -10,7 +10,7 @@
   6. 生成 5 条笔记（飞书速览 / 证据链 / 逐节精读 / 零基础拆解 / 决策地图）
   7. 写进 Zotero（图片作为附件，笔记里嵌完整性报告）
 """
-import os, sys, json, io, re, time, sqlite3, shutil, subprocess, argparse
+import os, sys, json, io, re, time, sqlite3, shutil, subprocess, argparse, hashlib
 from collections import defaultdict, Counter
 
 # ─── 路径常量（都可用环境变量覆盖，便于换机器）───
@@ -680,6 +680,143 @@ evidence_strength(explicit|inferred|guess) / impact / importance(1-5)。
     return res
 
 
+
+# ══════════════════════════════════════════
+# Zotero storage 索引检查 / 修复
+# ══════════════════════════════════════════
+def _copy_zotero_db(tag):
+    """把 Zotero 数据库（含 WAL）拷到临时目录，返回可读的 sqlite 路径。"""
+    tmp = os.path.join(TMP, tag)
+    if os.path.isdir(tmp):
+        shutil.rmtree(tmp)
+    os.makedirs(tmp, exist_ok=True)
+    for fn in ["zotero.sqlite", "zotero.sqlite-wal", "zotero.sqlite-shm"]:
+        p = os.path.join(ZOTERO, fn)
+        if os.path.exists(p):
+            shutil.copy2(p, os.path.join(tmp, fn))
+    return os.path.join(tmp, "zotero.sqlite")
+
+
+def _query_storage_state(dbpath, keys=None):
+    """返回 {key: (syncState, storageHash)}。keys=None 表示查全部 image/png。"""
+    conn = sqlite3.connect(dbpath)
+    cur = conn.cursor()
+    sql = """SELECT a.key, ia.syncState, ia.storageHash
+             FROM itemAttachments ia JOIN items a ON a.itemID = ia.itemID
+             WHERE ia.contentType = 'image/png'"""
+    params = ()
+    if keys:
+        sql += " AND a.key IN (%s)" % ",".join("?" * len(keys))
+        params = tuple(keys)
+    cur.execute(sql, params)
+    out = {k: (ss, sh) for k, ss, sh in cur.fetchall()}
+    conn.close()
+    return out
+
+
+def _check_storage_index(keys):
+    """写库后检查：Zotero 能不能渲染这些图片。
+
+    Zotero 渲染笔记里的 <img data-attachment-key> 时，会校验
+    itemAttachments.syncState / storageHash / storageModTime。
+    这三项没就绪时，即使 key 真实、文件也在，图在 Zotero 里就是不显示。
+    """
+    try:
+        db = _copy_zotero_db("_suite_storage")
+        state = _query_storage_state(db, list(keys))
+    except Exception as e:
+        log("  ⚠️ 查 storage 索引失败（不影响已写入的笔记）：%s" % str(e)[:100])
+        return
+
+    bad = [k for k, (ss, sh) in state.items() if ss == 0 or not sh]
+    if not bad:
+        log("  ✅ storage 索引就绪（%d 张图，Zotero 能直接渲染）" % len(state))
+        return
+
+    log("")
+    log("  ⚠️ 有 %d 张图的 storage 索引没就绪：%s" % (len(bad), bad))
+    log("     表现：Zotero 笔记里这些图位置是空的（key 和文件都没问题，是索引没建）。")
+    log("     处理：")
+    log("       1) 先试重启 Zotero（它会自己补索引）")
+    log("       2) 还不行就关掉 Zotero，跑：")
+    log("          python paper_reading_suite.py <任意key> --fix-storage")
+
+
+def fix_storage():
+    """补 image/png 附件的 storage 索引：syncState=2 + storageHash(MD5) + storageModTime。
+
+    必须在 Zotero 关闭时跑，否则会被 Zotero 覆盖。
+    """
+    sec("修复 Zotero storage 索引")
+    # 1. 确认 Zotero 没在跑
+    running = False
+    try:
+        if os.name == "nt":
+            out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq zotero.exe"],
+                                 capture_output=True, text=True, timeout=15)
+            running = "zotero.exe" in (out.stdout or "").lower()
+        else:
+            out = subprocess.run(["pgrep", "-x", "zotero"],
+                                 capture_output=True, text=True, timeout=15)
+            running = bool((out.stdout or "").strip())
+    except Exception:
+        pass
+    if running:
+        log("  ❌ Zotero 还在运行。先完全退出 Zotero 再跑这个命令，")
+        log("     否则你改的记录会被 Zotero 覆盖。")
+        raise SystemExit(1)
+
+    # 2. 找所有没就绪的
+    db = _copy_zotero_db("_suite_fixscan")
+    conn = sqlite3.connect(db)
+    cur = conn.cursor()
+    cur.execute("""SELECT a.key, ia.path, ia.syncState, ia.storageHash
+                   FROM itemAttachments ia JOIN items a ON a.itemID = ia.itemID
+                   WHERE ia.contentType = 'image/png'
+                     AND (ia.syncState = 0 OR ia.storageHash IS NULL)""")
+    todo = cur.fetchall()
+    conn.close()
+
+    if not todo:
+        log("  ✅ 所有图片附件的索引都已就绪，不用修")
+        return
+
+    log("  找到 %d 张需要修：" % len(todo))
+    for k, path, ss, sh in todo:
+        log("    %-11s syncState=%s hash=%s" % (k, ss, sh[:12] if sh else "空"))
+    log("")
+
+    # 3. 写在真库上（Zotero 已关闭）
+    realdb = os.path.join(ZOTERO, "zotero.sqlite")
+    conn = sqlite3.connect(realdb)
+    cur = conn.cursor()
+    ok = fail = 0
+    for k, path, ss, sh in todo:
+        rel = str(path).replace("storage:", "")
+        full = os.path.join(ZOTERO, "storage", k, rel)
+        if not os.path.exists(full):
+            log("    ❌ %-11s 磁盘文件不存在：%s" % (k, full))
+            fail += 1
+            continue
+        md5 = hashlib.md5(open(full, "rb").read()).hexdigest()
+        mt = int(os.stat(full).st_mtime * 1000)
+        cur.execute("""UPDATE itemAttachments
+                       SET syncState = 2, storageHash = ?, storageModTime = ?
+                       WHERE itemID = (SELECT itemID FROM items WHERE key = ?)""",
+                    (md5, mt, k))
+        if cur.rowcount == 1:
+            log("    ✅ %-11s hash=%s" % (k, md5[:16] + "…"))
+            ok += 1
+        else:
+            fail += 1
+    conn.commit()
+    conn.close()
+
+    log("")
+    log("  修好 %d 张，失败 %d 张" % (ok, fail))
+    log("  现在启动 Zotero，笔记里的图应该能显示了。")
+
+
 # ══════════════════════════════════════════
 # STEP 6：写进 Zotero
 # ══════════════════════════════════════════
@@ -810,6 +947,13 @@ def do_write(meta, notes, news, rend, report_md, work):
             real.add(k)
     conn.close()
     log("  数据库真实图片 key: %d 个" % len(real))
+
+    # 2.5 检查 Zotero 的 storage 索引（关键！）
+    # ⚠️ 光有 key 和磁盘文件还不够。Zotero 渲染笔记图片时会校验
+    #    itemAttachments.syncState / storageHash / storageModTime。
+    #    syncState=0 且 storageHash 为空时，图在 Zotero 里显示不出来（2026-10-25 实测踩过）。
+    #    Zotero 通常会异步补齐这三项，但通过 MCP import 的附件有时不会被处理到。
+    _check_storage_index(real)
 
     def img_for(pages):
         ps = []
@@ -1089,10 +1233,16 @@ def main():
     ap.add_argument("--skip-notes", action="store_true", help="只做检测 + 渲染 + 完整性报告，不调模型")
     ap.add_argument("--skip-write", action="store_true", help="生成笔记但不写进 Zotero")
     ap.add_argument("--check", action="store_true", help="只做环境预检，然后退出")
+    ap.add_argument("--fix-storage", action="store_true",
+                    help="（需先关闭 Zotero）补图片附件的 storage 索引，修「笔记里看不到图」")
     args = ap.parse_args()
 
     need_notes = not args.skip_notes
     need_write = need_notes and not args.skip_write
+
+    if args.fix_storage:
+        fix_storage()
+        return
 
     if args.check:
         # 全量检查，并把「三种用法各需要什么」一并打出来
